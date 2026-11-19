@@ -1,4 +1,4 @@
-"""GBM check-in: gradient validation, call Greeks and memory scaling.
+"""GBM check-in: gradient validation, call Greeks and memory/runtime scaling.
 
 An adaptation of Li et al. (2020); option pricing is our extension.
 Run `python gbm_adjoint.py --help` for experiment settings.
@@ -9,10 +9,18 @@ import csv
 import json
 import math
 from pathlib import Path
+import random
+import statistics
 import subprocess
 import sys
+import time
 
 import torch
+
+
+# Edit this hardware caption when another person/machine runs the benchmarks.
+# RAM below is the WSL2 VM allocation, not the host machine's physical RAM.
+HARDWARE_CAPTION = "Hardware: Intel Core i7-1260P | CPU, 1 thread | WSL2 VM: 1.9 GiB RAM"
 
 
 class StepNoise:
@@ -302,6 +310,19 @@ def call_comparison(output, paths, steps):
     print("Confidence intervals describe sampling error; a miss is not an automatic validation failure.")
 
 
+def evaluate_call(method, paths, steps):
+    """One complete Greek evaluation, including noise and final mean reductions."""
+    noise = StepNoise(steps, paths, 1 / steps)
+    increments = noise if method == "adjoint-regenerated" else noise.stored()
+    if method == "backprop":
+        delta, vega = backprop_gradients(increments, 1 / steps, 100.0, 0.05, 0.2, loss="call")
+    else:
+        terminal = milstein_gbm(increments, 1 / steps, 100.0, 0.05, 0.2)
+        weight = payoff_derivative(terminal, "call", 0.05, 1.0, 100.0)
+        delta, vega = adjoint_gradients(increments, 1 / steps, terminal, weight, 0.05, 0.2)
+    return delta.mean().item(), vega.mean().item()
+
+
 def memory_worker(method, paths, steps):
     """One end-to-end evaluation in a fresh process; no warm-up allocations.
 
@@ -315,17 +336,9 @@ def memory_worker(method, paths, steps):
         return peak / (1024**2 if sys.platform == "darwin" else 1024)
 
     baseline = peak_mib()
-    noise = StepNoise(steps, paths, 1 / steps)
-    increments = noise if method == "adjoint-regenerated" else noise.stored()
-    if method == "backprop":
-        delta, vega = backprop_gradients(increments, 1 / steps, 100.0, 0.05, 0.2, loss="call")
-    else:
-        terminal = milstein_gbm(increments, 1 / steps, 100.0, 0.05, 0.2)
-        weight = payoff_derivative(terminal, "call", 0.05, 1.0, 100.0)
-        delta, vega = adjoint_gradients(increments, 1 / steps, terminal, weight, 0.05, 0.2)
-    delta_mean, vega_mean = delta.mean().item(), vega.mean().item()
+    delta_mean, vega_mean = evaluate_call(method, paths, steps)
     peak = peak_mib()
-    print(json.dumps(dict(method=method, paths=paths, steps=steps, seed=noise.seed,
+    print(json.dumps(dict(method=method, paths=paths, steps=steps, seed=12345,
                           baseline_peak_mib=baseline, peak_rss_mib=peak,
                           increase_over_baseline_mib=max(0.0, peak - baseline),
                           delta=delta_mean, vega=vega_mean, dtype="float64", device="cpu",
@@ -376,33 +389,137 @@ def memory_benchmark(output, paths, step_counts):
     figure.savefig(output / "memory_scaling.png", dpi=160)
 
 
+def runtime_worker(paths, steps, repetitions):
+    """Warm up each method, then interleave methods in a reproducible shuffled order."""
+    methods = ["backprop", "adjoint-stored", "adjoint-regenerated"]
+    for method in methods:
+        evaluate_call(method, paths, steps)
+    order_rng = random.Random(2020)
+    rows = []
+    for repetition in range(1, repetitions + 1):
+        order_rng.shuffle(methods)
+        estimates = {}
+        for order, method in enumerate(methods, 1):
+            start = time.perf_counter()
+            delta, vega = evaluate_call(method, paths, steps)
+            seconds = time.perf_counter() - start
+            estimates[method] = (delta, vega)
+            rows.append(dict(method=method, paths=paths, steps=steps,
+                             repetition=repetition, order=order, seconds=seconds,
+                             delta=delta, vega=vega, seed=12345, order_seed=2020,
+                             warmups=1, dtype="float64", device="cpu", threads=1,
+                             torch_version=torch.__version__, python_version=sys.version.split()[0],
+                             platform=sys.platform))
+        assert estimates["adjoint-stored"] == estimates["adjoint-regenerated"]
+        assert math.isclose(estimates["backprop"][0], estimates["adjoint-stored"][0],
+                            rel_tol=1e-11, abs_tol=1e-12)
+    print(json.dumps(rows))
+
+
+def runtime_benchmark(output, fixed_paths, fixed_steps, step_counts, path_counts, repetitions):
+    rows, summaries = [], []
+    methods = ("backprop", "adjoint-stored", "adjoint-regenerated")
+    sweeps = [("steps", fixed_paths, steps) for steps in step_counts]
+    sweeps += [("paths", paths, fixed_steps) for paths in path_counts]
+    for sweep, paths, steps in sweeps:
+        command = [sys.executable, str(Path(__file__).resolve()), "--runtime-worker",
+                   "--paths", str(paths), "--steps", str(steps), "--repetitions", str(repetitions)]
+        result = subprocess.run(command, check=True, capture_output=True, text=True)
+        group = json.loads(result.stdout)
+        assert len(group) == 3 * repetitions
+        for row in group:
+            row["sweep"] = sweep
+        rows.extend(group)
+        for method in methods:
+            selected = [row for row in group if row["method"] == method]
+            assert {row["repetition"] for row in selected} == set(range(1, repetitions + 1))
+            samples = [row["seconds"] for row in selected]
+            assert all(math.isfinite(value) and value > 0 for value in samples)
+            q25, _, q75 = statistics.quantiles(samples, n=4, method="inclusive")
+            summaries.append(dict(sweep=sweep, method=method, paths=paths, steps=steps,
+                                  repetitions=repetitions, median_seconds=statistics.median(samples),
+                                  q25_seconds=q25, q75_seconds=q75,
+                                  min_seconds=min(samples), max_seconds=max(samples)))
+        write_csv(output / "runtime_samples.csv", rows)
+        write_csv(output / "runtime_summary.csv", summaries)
+        medians = ", ".join(f"{row['method']}: {1000 * row['median_seconds']:.2f} ms"
+                            for row in summaries[-3:])
+        print(f"N={paths:6d}, L={steps:4d}, {repetitions} repetitions each — {medians}", flush=True)
+
+    plot_runtime(output, summaries, fixed_paths, fixed_steps, repetitions)
+
+
+def plot_runtime(output, summaries, fixed_paths, fixed_steps, repetitions):
+    """Render saved timing summaries without rerunning benchmark measurements."""
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    methods = ("backprop", "adjoint-stored", "adjoint-regenerated")
+    figure = Figure(figsize=(11, 4.5), layout="constrained")
+    FigureCanvasAgg(figure)
+    for axis, sweep, xlabel, title in zip(
+        figure.subplots(1, 2), ("steps", "paths"), ("Time steps L", "Simulated paths N"),
+        (f"Step scaling (N={fixed_paths:,})", f"Path scaling (L={fixed_steps})")
+    ):
+        for method in methods:
+            selected = sorted((row for row in summaries if row["sweep"] == sweep
+                               and row["method"] == method), key=lambda row: row[sweep])
+            x = [row[sweep] for row in selected]
+            line, = axis.loglog(x, [row["median_seconds"] for row in selected], "o-", label=method)
+            axis.fill_between(x, [row["q25_seconds"] for row in selected],
+                              [row["q75_seconds"] for row in selected], color=line.get_color(), alpha=0.18)
+        axis.set(xlabel=xlabel, ylabel="Seconds per delta + vega evaluation", title=title)
+        axis.grid(alpha=0.25, which="both")
+        axis.legend()
+    figure.suptitle(f"CPU runtime: median and interquartile range of {repetitions} repetitions; float64, 1 thread")
+    figure.supxlabel(HARDWARE_CAPTION, fontsize=8, color="0.4")
+    figure.savefig(output / "runtime_scaling.png", dpi=180)
+    figure.savefig(output / "runtime_scaling.pdf")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--paths", type=int, default=100_000, help="Call Monte Carlo paths")
     parser.add_argument("--steps", type=int, default=100, help="Call time steps")
     parser.add_argument("--seeds", type=int, default=8, help="Smooth-validation seeds")
     parser.add_argument("--smooth-paths", type=int, default=1000)
-    parser.add_argument("--benchmark-memory", action="store_true", help="Run only noise validation and fresh-process CPU memory measurements")
+    benchmarks = parser.add_mutually_exclusive_group()
+    benchmarks.add_argument("--benchmark-memory", action="store_true", help="Run only noise validation and fresh-process CPU memory measurements")
+    benchmarks.add_argument("--benchmark-runtime", action="store_true", help="Run only noise validation and repeated CPU runtime measurements")
+    parser.add_argument("--repetitions", type=int, default=20, help="Measured runtime repetitions per method/configuration")
+    parser.add_argument("--runtime-fixed-paths", type=int, default=2000)
+    parser.add_argument("--runtime-fixed-steps", type=int, default=100)
+    parser.add_argument("--runtime-step-counts", type=int, nargs="+", default=[10, 30, 100, 300, 1000])
+    parser.add_argument("--runtime-path-counts", type=int, nargs="+", default=[1000, 3000, 10000, 30000, 50000])
+    parser.add_argument("--runtime-worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--memory-paths", type=int, default=256, help="Fixed path count for memory sweep")
     parser.add_argument("--memory-steps", type=int, nargs="+", default=[10, 100, 1000, 10000])
     parser.add_argument("--memory-worker", choices=("backprop", "adjoint-stored", "adjoint-regenerated"),
                         help=argparse.SUPPRESS)
     parser.add_argument("--output", type=Path, default=Path(__file__).parent / "results")
     args = parser.parse_args()
-    if min(args.paths, args.smooth_paths, args.memory_paths) < 2 or min(args.steps, args.seeds, *args.memory_steps) < 1:
-        parser.error("Path counts must be >= 2; steps and seeds must be >= 1")
+    if min(args.paths, args.smooth_paths, args.memory_paths, args.runtime_fixed_paths,
+           *args.runtime_path_counts, args.repetitions) < 2 or min(
+               args.steps, args.seeds, *args.memory_steps, args.runtime_fixed_steps, *args.runtime_step_counts) < 1:
+        parser.error("Path counts and repetitions must be >= 2; steps and seeds must be >= 1")
     torch.set_num_threads(1)
     if args.memory_worker:
         memory_worker(args.memory_worker, args.paths, args.steps)
+        return
+    if args.runtime_worker:
+        runtime_worker(args.paths, args.steps, args.repetitions)
         return
     args.output.mkdir(parents=True, exist_ok=True)
     validate_noise()
     if args.benchmark_memory:
         memory_benchmark(args.output, args.memory_paths, args.memory_steps)
+    elif args.benchmark_runtime:
+        runtime_benchmark(args.output, args.runtime_fixed_paths, args.runtime_fixed_steps,
+                          args.runtime_step_counts, args.runtime_path_counts, args.repetitions)
     else:
         smooth_validation(args.output, args.seeds, args.smooth_paths)
         call_comparison(args.output, args.paths, args.steps)
-    print(f"\nSaved CSV tables and convergence plot to {args.output.resolve()}")
+    print(f"\nSaved experiment outputs to {args.output.resolve()}")
 
 
 if __name__ == "__main__":
