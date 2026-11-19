@@ -1,0 +1,13 @@
+method,phase,seconds
+backprop,noise,0.0008005739946383983
+backprop,forward,0.06364191299508093
+backprop,backward,0.13304220799909672
+backprop,finish,0.18646745399746578
+adjoint-stored,noise,0.0006413570008589886
+adjoint-stored,forward,0.057198349000827875
+adjoint-stored,backward,0.07202050499472534
+adjoint-stored,finish,0.11062675299763214
+adjoint-regenerated,noise,0.0006521870018332265
+adjoint-regenerated,forward,0.0007577270007459447
+adjoint-regenerated,backward,0.07112760400195839
+adjoint-regenerated,finish,0.15447622700594366

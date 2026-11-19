@@ -16,6 +16,7 @@ htmlcov/
 # Notebook checkpoints and reproducible experiment outputs
 .ipynb_checkpoints/
 /results/
+# sample_results/ is an intentionally versioned, one-time sharing snapshot.
 /gbm_convergence.png
 
 # Local secrets and editor/OS files
