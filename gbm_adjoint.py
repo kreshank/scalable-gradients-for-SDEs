@@ -1,13 +1,50 @@
-"""Scalar GBM replication of Li et al. (2020), Algorithm 3 and Figure 7(a).
+"""Stored-noise GBM check-in: smooth-loss validation and European call Greeks.
 
-Run with `python gbm_adjoint.py` after installing torch and matplotlib.
-Brownian increments are stored as a tensor of shape (steps, paths).
+An adaptation of Li et al. (2020); option pricing is our extension.
+Run `python gbm_adjoint.py --help` for experiment settings.
 """
 
+import argparse
+import csv
 import math
 from pathlib import Path
 
 import torch
+
+
+def black_scholes(s0, strike, rate, sigma, maturity):
+    """Price, delta and vega (per unit volatility), for positive inputs."""
+    if min(s0, strike, sigma, maturity) <= 0:
+        raise ValueError("Spot, strike, volatility and maturity must be positive")
+    root_time = math.sqrt(maturity)
+    d1 = (math.log(s0 / strike) + (rate + sigma**2 / 2) * maturity) / (sigma * root_time)
+    d2 = d1 - sigma * root_time
+    cdf = lambda x: 0.5 * (1 + math.erf(x / math.sqrt(2)))
+    density = math.exp(-d1**2 / 2) / math.sqrt(2 * math.pi)
+    return (s0 * cdf(d1) - strike * math.exp(-rate * maturity) * cdf(d2),
+            cdf(d1), s0 * density * root_time)
+
+
+def payoff(terminal, loss, rate, maturity, strike):
+    if loss == "terminal":
+        return terminal
+    if loss == "square":
+        return terminal.square()
+    if loss == "call":
+        return math.exp(-rate * maturity) * torch.where(
+            terminal > strike, terminal - strike, torch.zeros_like(terminal)
+        )
+    raise ValueError(f"Unknown loss: {loss}")
+
+
+def payoff_derivative(terminal, loss, rate, maturity, strike):
+    if loss == "terminal":
+        return torch.ones_like(terminal)
+    if loss == "square":
+        return 2 * terminal
+    if loss == "call":
+        return math.exp(-rate * maturity) * (terminal > strike).to(terminal.dtype)
+    raise ValueError(f"Unknown loss: {loss}")
 
 
 def exact_gbm(increments, dt, s0, mu, sigma):
@@ -28,16 +65,18 @@ def milstein_gbm(increments, dt, s0, mu, sigma):
     return state
 
 
-def backprop_gradients(increments, dt, s0, mu, sigma):
+def backprop_gradients(increments, dt, s0, mu, sigma, loss="terminal", strike=100.0):
     # Independent copies give one derivative per path in a single autograd call.
     spot = torch.full_like(increments[0], s0, requires_grad=True)
     volatility = torch.full_like(increments[0], sigma, requires_grad=True)
     terminal = milstein_gbm(increments, dt, spot, mu, volatility)
-    return torch.autograd.grad(terminal.sum(), (spot, volatility))
+    values = payoff(terminal, loss, mu, increments.shape[0] * dt, strike)
+    return torch.autograd.grad(values.sum(), (spot, volatility))
 
 
 @torch.no_grad()
-def adjoint_gradients(increments, dt, terminal, terminal_grad, mu, sigma):
+def adjoint_gradients(increments, dt, terminal, terminal_grad, mu, sigma,
+                      return_state=False):
     """Return dLoss/dS0 and dLoss/dsigma by solving the backward SDE."""
     state = terminal
     state_adjoint = terminal_grad
@@ -53,62 +92,166 @@ def adjoint_gradients(increments, dt, terminal, terminal_grad, mu, sigma):
         sigma_adjoint = sigma_adjoint + state * state_adjoint * (dw - sigma * dt)
         state_adjoint = state_adjoint * (1 + linear + correction)
         state = state * (1 - linear + correction)
+    if return_state:
+        return state_adjoint, sigma_adjoint, state
     return state_adjoint, sigma_adjoint
 
 
-def main():
+def estimate(values):
+    return values.mean().item(), values.std(unbiased=True).item() / math.sqrt(values.numel())
+
+
+def write_csv(path, rows):
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def smooth_validation(output, seeds, paths):
+    """Couple nested grids so each seed has the same Brownian terminal value."""
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
 
-    s0, mu, sigma, maturity = 1.0, 0.05, 0.20, 1.0
-    step_counts = (8, 16, 32, 64, 128, 256, 512)
-    paths = 2048
-    finest = step_counts[-1]
-    rng = torch.Generator().manual_seed(2020)
-    fine_noise = torch.randn(finest, paths, generator=rng, dtype=torch.float64)
-    fine_noise *= math.sqrt(maturity / finest)
-
-    errors = {"Adjoint": [], "Backprop": []}
-    step_sizes = []
-    print("Steps   Adjoint S0   Backprop S0   Adjoint sigma   Backprop sigma")
-    for steps in step_counts:
-        dt = maturity / steps
-        step_sizes.append(dt)
-        increments = fine_noise.reshape(steps, finest // steps, paths).sum(dim=1)
-        _, exact_s0, exact_sigma = exact_gbm(increments, dt, s0, mu, sigma)
-        terminal = milstein_gbm(increments, dt, s0, mu, sigma)
-        gradients = {
-            "Adjoint": adjoint_gradients(
-                increments, dt, terminal, torch.ones_like(terminal), mu, sigma
-            ),
-            "Backprop": backprop_gradients(increments, dt, s0, mu, sigma),
-        }
-        for method, (grad_s0, grad_sigma) in gradients.items():
-            rmse_s0 = (grad_s0 - exact_s0).square().mean().sqrt().item()
-            rmse_sigma = (grad_sigma - exact_sigma).square().mean().sqrt().item()
-            errors[method].append((rmse_s0, rmse_sigma))
-        adjoint_s0, adjoint_sigma = errors["Adjoint"][-1]
-        backprop_s0, backprop_sigma = errors["Backprop"][-1]
-        print(f"{steps:5d}   {adjoint_s0:10.3e}   {backprop_s0:11.3e}   "
-              f"{adjoint_sigma:13.3e}   {backprop_sigma:14.3e}")
-
-    figure = Figure(figsize=(8.5, 3.8), layout="constrained")
-    FigureCanvasAgg(figure)
-    figure.suptitle("GBM gradient convergence under Milstein discretization")
-    axes = figure.subplots(1, 2)
-    for index, (axis, parameter) in enumerate(zip(axes, ("$S_0$", r"$\sigma$"))):
-        for method, style in (("Adjoint", "o-"), ("Backprop", "s--")):
-            axis.loglog(
-                step_sizes, [row[index] for row in errors[method]],
-                style, label=method, markerfacecolor="none",
+    s0, rate, sigma, maturity = 100.0, 0.05, 0.2, 1.0
+    step_counts = (10, 20, 50, 100, 200, 500, 1000)
+    rows = []
+    max_delta_difference = 0.0
+    for seed in range(seeds):
+        generator = torch.Generator().manual_seed(2020 + seed)
+        fine = torch.randn(1000, paths, generator=generator, dtype=torch.float64)
+        fine *= math.sqrt(maturity / 1000)
+        for steps in step_counts:
+            dt = maturity / steps
+            increments = fine.reshape(steps, 1000 // steps, paths).sum(dim=1)
+            exact, exact_s0, exact_sigma = exact_gbm(increments, dt, s0, rate, sigma)
+            terminal = milstein_gbm(increments, dt, s0, rate, sigma)
+            # Explicitly verify the algebraic Ito/Stratonovich equivalence.
+            dw = increments[0]
+            ito = 1 + rate * dt + sigma * dw + 0.5 * sigma**2 * (dw.square() - dt)
+            strat = 1 + (rate - sigma**2 / 2) * dt + sigma * dw + 0.5 * sigma**2 * dw.square()
+            torch.testing.assert_close(ito, strat, rtol=1e-14, atol=1e-14)
+            adj_s0, adj_sigma, rebuilt = adjoint_gradients(
+                increments, dt, terminal, 2 * terminal, rate, sigma, return_state=True
             )
-        axis.set(xlabel=r"Step size $\Delta t$", ylabel=f"Gradient RMSE for {parameter}")
-        axis.grid(alpha=0.25, which="major")
+            bp_s0, bp_sigma = backprop_gradients(
+                increments, dt, s0, rate, sigma, loss="square"
+            )
+            torch.testing.assert_close(adj_s0, bp_s0, rtol=1e-11, atol=1e-10)
+            max_delta_difference = max(max_delta_difference, (adj_s0 - bp_s0).abs().max().item())
+            for method, gradients in (("Adjoint", (adj_s0, adj_sigma)),
+                                      ("Backprop", (bp_s0, bp_sigma))):
+                rows.append(dict(
+                    seed=2020 + seed, steps=steps, dt=dt, method=method,
+                    s0_rmse=(gradients[0] - 2 * exact * exact_s0).square().mean().sqrt().item(),
+                    sigma_rmse=(gradients[1] - 2 * exact * exact_sigma).square().mean().sqrt().item(),
+                    terminal_rmse=(terminal - exact).square().mean().sqrt().item(),
+                    reconstruction_max=(rebuilt - s0).abs().max().item(),
+                ))
+
+    def average(method, steps, key):
+        values = [row[key] for row in rows if row["method"] == method and row["steps"] == steps]
+        return sum(values) / len(values)
+
+    # Check aggregate improvement, rather than require monotonicity for every seed.
+    for method in ("Adjoint", "Backprop"):
+        for key in ("s0_rmse", "sigma_rmse", "terminal_rmse", "reconstruction_max"):
+            assert average(method, 1000, key) < average(method, 10, key), (method, key)
+    write_csv(output / "smooth_validation.csv", rows)
+    figure = Figure(figsize=(9, 4), layout="constrained")
+    FigureCanvasAgg(figure)
+    for axis, key, label in zip(figure.subplots(1, 2),
+                                ("s0_rmse", "sigma_rmse"), ("S0", "sigma")):
+        for method, marker in (("Adjoint", "o-"), ("Backprop", "s--")):
+            axis.loglog([1 / steps for steps in step_counts],
+                        [average(method, steps, key) for steps in step_counts],
+                        marker, label=method, markerfacecolor="none")
+        axis.set(xlabel="Step size", ylabel=f"{label} gradient RMSE")
+        axis.grid(alpha=0.25)
         axis.legend()
-    axes[0].set_title("Curves overlap for $S_0$")
-    output = Path(__file__).with_name("gbm_convergence.png")
-    figure.savefig(output, dpi=180)
-    print(f"Saved {output}")
+    figure.suptitle(f"Squared-loss gradient validation ({seeds} seeds; mean pathwise RMSE)")
+    figure.savefig(output / "smooth_convergence.png", dpi=160)
+    print("Smooth validation passed: forward, reconstruction and both gradients improve.")
+    print(f"Maximum per-path adjoint/backprop S0 difference: {max_delta_difference:.3e}")
+    for method in ("Adjoint", "Backprop"):
+        print(f"  {method} sigma RMSE: {average(method, 10, 'sigma_rmse'):.3e}"
+              f" -> {average(method, 1000, 'sigma_rmse'):.3e}")
+    print(f"  Reconstruction max error (mean across seeds): "
+          f"{average('Adjoint', 10, 'reconstruction_max'):.3e} -> "
+          f"{average('Adjoint', 1000, 'reconstruction_max'):.3e}")
+
+
+def call_comparison(output, paths, steps):
+    s0, strike, rate, sigma, maturity = 100.0, 100.0, 0.05, 0.2, 1.0
+    reference = black_scholes(s0, strike, rate, sigma, maturity)
+    for actual, expected in zip(reference, (10.450583572185565, 0.6368306511756191, 37.52403469169379)):
+        assert math.isclose(actual, expected, rel_tol=1e-12)
+    dt = maturity / steps
+    generator = torch.Generator().manual_seed(12345)
+    increments = torch.randn(steps, paths, generator=generator, dtype=torch.float64) * math.sqrt(dt)
+    terminal = milstein_gbm(increments, dt, s0, rate, sigma)
+    price = payoff(terminal, "call", rate, maturity, strike)
+    bp = backprop_gradients(increments, dt, s0, rate, sigma, loss="call", strike=strike)
+    adj = adjoint_gradients(increments, dt, terminal,
+                            payoff_derivative(terminal, "call", rate, maturity, strike), rate, sigma)
+    torch.testing.assert_close(adj[0], bp[0], rtol=1e-11, atol=1e-12)
+    # Independently check the analytic delta of the discrete multiplicative solver.
+    torch.testing.assert_close(bp[0], payoff_derivative(terminal, "call", rate, maturity, strike)
+                               * terminal / s0, rtol=1e-11, atol=1e-12)
+    # Cover the payoff kink consistently in both gradient methods.
+    at_strike = torch.tensor([strike], dtype=torch.float64, requires_grad=True)
+    kink_loss = payoff(at_strike, "call", rate, maturity, strike)
+    assert torch.autograd.grad(kink_loss.sum(), at_strike)[0].item() == 0.0
+    assert payoff_derivative(at_strike.detach(), "call", rate, maturity, strike).item() == 0.0
+    exact, exact_s0, exact_sigma = exact_gbm(increments, dt, s0, rate, sigma)
+    exact_weight = payoff_derivative(exact, "call", rate, maturity, strike)
+    exact_values = (payoff(exact, "call", rate, maturity, strike),
+                    exact_weight * exact_s0, exact_weight * exact_sigma)
+    rows = []
+    for method, values in (("Black-Scholes", None), ("Exact GBM Monte Carlo", exact_values),
+                           ("Backprop", (price, *bp)),
+                           ("Adjoint (stored noise)", (price, *adj))):
+        for index, quantity in enumerate(("price", "delta", "vega")):
+            mean, se = (reference[index], 0.0) if values is None else estimate(values[index])
+            difference = mean - reference[index]
+            rows.append(dict(method=method, quantity=quantity, estimate=mean, se=se,
+                             ci_low=mean - 1.96 * se, ci_high=mean + 1.96 * se,
+                             reference=reference[index], difference=difference,
+                             difference_in_se=difference / se if se else "",
+                             paths=paths if values is not None else "", steps=steps if values is not None else "",
+                             seed=12345 if values is not None else "", dtype="float64", device="cpu"))
+    write_csv(output / "call_greeks.csv", rows)
+    print(f"\nCall comparison: N={paths}, L={steps}, seed=12345, float64, CPU")
+    print(f"{'Method':24} {'Quantity':8} {'Estimate':>12} {'SE':>12} {'Diff/SE':>10}")
+    for row in rows:
+        z = row['difference_in_se']
+        z_text = f"{z:.3f}" if z != "" else "-"
+        print(f"{row['method']:24} {row['quantity']:8} {row['estimate']:12.6f} "
+              f"{row['se']:12.6f} {z_text:>10}")
+    print(f"Call per-path delta agreement passed; max difference "
+          f"{(adj[0] - bp[0]).abs().max().item():.3e}")
+    print("Paired Backprop minus exact-GBM Monte Carlo differences (estimate +/- SE):")
+    for quantity, numerical, analytical in zip(("price", "delta", "vega"), (price, *bp), exact_values):
+        difference, se = estimate(numerical - analytical)
+        print(f"  {quantity}: {difference:.6g} +/- {se:.6g}")
+    print("Confidence intervals describe sampling error; a miss is not an automatic validation failure.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--paths", type=int, default=100_000, help="Call Monte Carlo paths")
+    parser.add_argument("--steps", type=int, default=100, help="Call time steps")
+    parser.add_argument("--seeds", type=int, default=8, help="Smooth-validation seeds")
+    parser.add_argument("--smooth-paths", type=int, default=1000)
+    parser.add_argument("--output", type=Path, default=Path(__file__).parent / "results")
+    args = parser.parse_args()
+    if min(args.paths, args.smooth_paths) < 2 or min(args.steps, args.seeds) < 1:
+        parser.error("Path counts must be >= 2; steps and seeds must be >= 1")
+    torch.set_num_threads(1)
+    args.output.mkdir(parents=True, exist_ok=True)
+    smooth_validation(args.output, args.seeds, args.smooth_paths)
+    call_comparison(args.output, args.paths, args.steps)
+    print(f"\nSaved CSV tables and convergence plot to {args.output.resolve()}")
 
 
 if __name__ == "__main__":
