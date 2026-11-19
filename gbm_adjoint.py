@@ -1,4 +1,4 @@
-"""Stored-noise GBM check-in: smooth-loss validation and European call Greeks.
+"""GBM check-in: gradient validation, call Greeks and memory scaling.
 
 An adaptation of Li et al. (2020); option pricing is our extension.
 Run `python gbm_adjoint.py --help` for experiment settings.
@@ -6,10 +6,66 @@ Run `python gbm_adjoint.py --help` for experiment settings.
 
 import argparse
 import csv
+import json
 import math
 from pathlib import Path
+import subprocess
+import sys
 
 import torch
+
+
+class StepNoise:
+    """Fixed-grid CPU float64 noise with O(paths) memory and random step access.
+
+    Each step uses its own local generator. Replaying a step does not depend on
+    query order or change PyTorch's global RNG. This is not a Brownian tree:
+    changing the grid does not preserve the underlying Brownian path.
+    """
+
+    def __init__(self, steps, paths, dt, seed=12345):
+        self.shape = (steps, paths)
+        self.dt = dt
+        self.seed = seed
+
+    def __getitem__(self, step):
+        if not 0 <= step < self.shape[0]:
+            raise IndexError(step)
+        step_seed = (self.seed + step * 0x9E3779B97F4A7C15) % (2**63 - 1)
+        generator = torch.Generator().manual_seed(step_seed)
+        return torch.randn(self.shape[1], generator=generator, dtype=torch.float64) * math.sqrt(self.dt)
+
+    def stored(self):
+        # Fill directly rather than stack a list and temporarily double storage.
+        increments = torch.empty(self.shape, dtype=torch.float64)
+        for step in range(self.shape[0]):
+            increments[step] = self[step]
+        return increments
+
+
+def validate_noise():
+    """Check replay and complete gradients, including reverse queries and RNG isolation."""
+    rng_before = torch.random.get_rng_state().clone()
+    for seed in (0, 12345, 2020):
+        for steps, paths in ((1, 2), (17, 127), (100, 256)):
+            dt = 1 / steps
+            noise = StepNoise(steps, paths, dt, seed)
+            stored = noise.stored()
+            for step in reversed(range(steps)):
+                assert torch.equal(noise[step], stored[step]), (seed, step)
+            terminal = milstein_gbm(stored, dt, 100.0, 0.05, 0.2)
+            regenerated = milstein_gbm(noise, dt, 100.0, 0.05, 0.2)
+            assert torch.equal(terminal, regenerated)
+            for loss in ("square", "call"):
+                weight = payoff_derivative(terminal, loss, 0.05, 1.0, 100.0)
+                expected = adjoint_gradients(stored, dt, terminal, weight, 0.05, 0.2,
+                                             return_state=True)
+                actual = adjoint_gradients(noise, dt, regenerated, weight, 0.05, 0.2,
+                                           return_state=True)
+                for lhs, rhs in zip(expected, actual):
+                    assert torch.equal(lhs, rhs), (seed, steps, loss)
+    assert torch.equal(rng_before, torch.random.get_rng_state())
+    print("Noise replay passed: bitwise increments, terminal states, both gradients and reconstruction; global RNG unchanged.")
 
 
 def black_scholes(s0, strike, rate, sigma, maturity):
@@ -187,13 +243,21 @@ def call_comparison(output, paths, steps):
     for actual, expected in zip(reference, (10.450583572185565, 0.6368306511756191, 37.52403469169379)):
         assert math.isclose(actual, expected, rel_tol=1e-12)
     dt = maturity / steps
-    generator = torch.Generator().manual_seed(12345)
-    increments = torch.randn(steps, paths, generator=generator, dtype=torch.float64) * math.sqrt(dt)
+    noise = StepNoise(steps, paths, dt)
+    increments = noise.stored()
     terminal = milstein_gbm(increments, dt, s0, rate, sigma)
     price = payoff(terminal, "call", rate, maturity, strike)
     bp = backprop_gradients(increments, dt, s0, rate, sigma, loss="call", strike=strike)
     adj = adjoint_gradients(increments, dt, terminal,
                             payoff_derivative(terminal, "call", rate, maturity, strike), rate, sigma)
+    regenerated_terminal = milstein_gbm(noise, dt, s0, rate, sigma)
+    assert torch.equal(terminal, regenerated_terminal)
+    regenerated_adj = adjoint_gradients(
+        noise, dt, regenerated_terminal,
+        payoff_derivative(regenerated_terminal, "call", rate, maturity, strike), rate, sigma
+    )
+    for stored_gradient, regenerated_gradient in zip(adj, regenerated_adj):
+        assert torch.equal(stored_gradient, regenerated_gradient)
     torch.testing.assert_close(adj[0], bp[0], rtol=1e-11, atol=1e-12)
     # Independently check the analytic delta of the discrete multiplicative solver.
     torch.testing.assert_close(bp[0], payoff_derivative(terminal, "call", rate, maturity, strike)
@@ -210,7 +274,8 @@ def call_comparison(output, paths, steps):
     rows = []
     for method, values in (("Black-Scholes", None), ("Exact GBM Monte Carlo", exact_values),
                            ("Backprop", (price, *bp)),
-                           ("Adjoint (stored noise)", (price, *adj))):
+                           ("Adjoint (stored noise)", (price, *adj)),
+                           ("Adjoint (regenerated)", (price, *regenerated_adj))):
         for index, quantity in enumerate(("price", "delta", "vega")):
             mean, se = (reference[index], 0.0) if values is None else estimate(values[index])
             difference = mean - reference[index]
@@ -237,20 +302,106 @@ def call_comparison(output, paths, steps):
     print("Confidence intervals describe sampling error; a miss is not an automatic validation failure.")
 
 
+def memory_worker(method, paths, steps):
+    """One end-to-end evaluation in a fresh process; no warm-up allocations.
+
+    resource reports process peak RSS, including Python/PyTorch and noise, not
+    just tensor bytes. Linux reports KiB; macOS reports bytes.
+    """
+    import resource
+
+    def peak_mib():
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return peak / (1024**2 if sys.platform == "darwin" else 1024)
+
+    baseline = peak_mib()
+    noise = StepNoise(steps, paths, 1 / steps)
+    increments = noise if method == "adjoint-regenerated" else noise.stored()
+    if method == "backprop":
+        delta, vega = backprop_gradients(increments, 1 / steps, 100.0, 0.05, 0.2, loss="call")
+    else:
+        terminal = milstein_gbm(increments, 1 / steps, 100.0, 0.05, 0.2)
+        weight = payoff_derivative(terminal, "call", 0.05, 1.0, 100.0)
+        delta, vega = adjoint_gradients(increments, 1 / steps, terminal, weight, 0.05, 0.2)
+    delta_mean, vega_mean = delta.mean().item(), vega.mean().item()
+    peak = peak_mib()
+    print(json.dumps(dict(method=method, paths=paths, steps=steps, seed=noise.seed,
+                          baseline_peak_mib=baseline, peak_rss_mib=peak,
+                          increase_over_baseline_mib=max(0.0, peak - baseline),
+                          delta=delta_mean, vega=vega_mean, dtype="float64", device="cpu",
+                          torch_version=torch.__version__, python_version=sys.version.split()[0],
+                          platform=sys.platform)))
+
+
+def memory_benchmark(output, paths, step_counts):
+    if sys.platform not in ("linux", "darwin"):
+        raise RuntimeError("CPU peak-RSS benchmark requires Linux/WSL or macOS (resource.ru_maxrss)")
+    methods = ("backprop", "adjoint-stored", "adjoint-regenerated")
+    rows = []
+    for steps in step_counts:
+        group = []
+        for method in methods:
+            # Each worker starts from imports, then allocates its own noise and
+            # performs both passes. No other configuration's tensors enter it.
+            command = [sys.executable, str(Path(__file__).resolve()), "--memory-worker", method,
+                       "--paths", str(paths), "--steps", str(steps)]
+            result = subprocess.run(command, check=True, capture_output=True, text=True)
+            row = json.loads(result.stdout)
+            group.append(row)
+            rows.append(row)
+            print(f"{method:22} L={steps:5d} peak={row['peak_rss_mib']:.1f} MiB "
+                  f"(above startup peak: {row['increase_over_baseline_mib']:.1f} MiB)", flush=True)
+            write_csv(output / "memory_scaling.csv", rows)
+        assert group[1]["delta"] == group[2]["delta"]
+        assert group[1]["vega"] == group[2]["vega"]
+        assert math.isclose(group[0]["delta"], group[1]["delta"], rel_tol=1e-11, abs_tol=1e-12)
+
+    # Import plotting only in the parent after collecting the worker results.
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    figure = Figure(figsize=(10, 4), layout="constrained")
+    FigureCanvasAgg(figure)
+    for axis, key, label in zip(figure.subplots(1, 2),
+                                ("peak_rss_mib", "increase_over_baseline_mib"),
+                                ("Process peak RSS (MiB)", "Increase over startup peak (MiB)")):
+        for method in methods:
+            selected = [row for row in rows if row["method"] == method]
+            axis.semilogx([row["steps"] for row in selected], [row[key] for row in selected],
+                         "o-", label=method)
+        axis.set(xlabel="Time steps L", ylabel=label)
+        axis.grid(alpha=0.25)
+        axis.legend()
+    figure.suptitle(f"CPU memory scaling: N={paths}, float64; fresh process per configuration")
+    figure.savefig(output / "memory_scaling.png", dpi=160)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--paths", type=int, default=100_000, help="Call Monte Carlo paths")
     parser.add_argument("--steps", type=int, default=100, help="Call time steps")
     parser.add_argument("--seeds", type=int, default=8, help="Smooth-validation seeds")
     parser.add_argument("--smooth-paths", type=int, default=1000)
+    parser.add_argument("--benchmark-memory", action="store_true", help="Run only noise validation and fresh-process CPU memory measurements")
+    parser.add_argument("--memory-paths", type=int, default=256, help="Fixed path count for memory sweep")
+    parser.add_argument("--memory-steps", type=int, nargs="+", default=[10, 100, 1000, 10000])
+    parser.add_argument("--memory-worker", choices=("backprop", "adjoint-stored", "adjoint-regenerated"),
+                        help=argparse.SUPPRESS)
     parser.add_argument("--output", type=Path, default=Path(__file__).parent / "results")
     args = parser.parse_args()
-    if min(args.paths, args.smooth_paths) < 2 or min(args.steps, args.seeds) < 1:
+    if min(args.paths, args.smooth_paths, args.memory_paths) < 2 or min(args.steps, args.seeds, *args.memory_steps) < 1:
         parser.error("Path counts must be >= 2; steps and seeds must be >= 1")
     torch.set_num_threads(1)
+    if args.memory_worker:
+        memory_worker(args.memory_worker, args.paths, args.steps)
+        return
     args.output.mkdir(parents=True, exist_ok=True)
-    smooth_validation(args.output, args.seeds, args.smooth_paths)
-    call_comparison(args.output, args.paths, args.steps)
+    validate_noise()
+    if args.benchmark_memory:
+        memory_benchmark(args.output, args.memory_paths, args.memory_steps)
+    else:
+        smooth_validation(args.output, args.seeds, args.smooth_paths)
+        call_comparison(args.output, args.paths, args.steps)
     print(f"\nSaved CSV tables and convergence plot to {args.output.resolve()}")
 
 
